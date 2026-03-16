@@ -23,6 +23,7 @@ use {crate::cache::CacheUtil, crate::state::get_config};
 use crate::tests::{cache_mock::MockCacheUtil as CacheUtil, config_mock::mock_state::get_config};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_message::VersionedMessage;
+use solana_program_pack::Pack;
 use solana_sdk::pubkey::Pubkey;
 
 #[derive(Debug, Clone)]
@@ -134,16 +135,17 @@ impl FeeConfigUtil {
     }
 
     /// Analyze payment instructions in transaction
-    /// Returns (has_payment, total_transfer_fees)
+    /// Returns (has_payment, total_transfer_fees, ata_rent_lamports)
     async fn analyze_payment_instructions(
         resolved_transaction: &mut VersionedTransactionResolved,
         rpc_client: &RpcClient,
         fee_payer: &Pubkey,
-    ) -> Result<(bool, u64), KoraError> {
+    ) -> Result<(bool, u64, u64), KoraError> {
         let config = get_config()?;
         let payment_destination = config.kora.get_payment_address(fee_payer)?;
         let mut has_payment = false;
         let mut total_transfer_fees = 0u64;
+        let mut ata_rent_lamports = 0u64;
 
         let parsed_spl_instructions = resolved_transaction.get_or_parse_spl_instructions()?;
 
@@ -159,6 +161,29 @@ impl FeeConfigUtil {
                 ..
             } = instruction
             {
+                // Add rent for missing destination ATA
+                if CacheUtil::get_account(rpc_client, destination_address, false).await.is_err() {
+                    let space = if *is_2022 {
+                        spl_token_2022_interface::state::Account::LEN
+                    } else {
+                        spl_token_interface::state::Account::LEN
+                    };
+
+                    let rent = rpc_client
+                        .get_minimum_balance_for_rent_exemption(space)
+                        .await
+                        .map_err(|e| KoraError::RpcError(e.to_string()))?;
+
+                    ata_rent_lamports = ata_rent_lamports.checked_add(rent).ok_or_else(|| {
+                        log::error!(
+                            "ATA rent accumulation overflow: total={}, new_rent={}",
+                            ata_rent_lamports,
+                            rent
+                        );
+                        KoraError::ValidationError("ATA rent accumulation overflow".to_string())
+                    })?;
+                }
+
                 // Check if this is a payment to Kora
                 let payment_info = Self::get_payment_instruction_info(
                     rpc_client,
@@ -168,41 +193,43 @@ impl FeeConfigUtil {
                 )
                 .await?;
 
-                if payment_info.is_some() {
-                    has_payment = true;
+                if payment_info.is_none() {
+                    continue;
+                }
 
-                    // Calculate Token2022 transfer fees if applicable
-                    if *is_2022 {
-                        if let Some(mint_pubkey) = mint {
-                            let mint_account =
-                                CacheUtil::get_account(rpc_client, mint_pubkey, true).await?;
+                has_payment = true;
 
-                            let token_program =
-                                TokenType::get_token_program_from_owner(&mint_account.owner)?;
-                            let mint_state =
-                                token_program.unpack_mint(mint_pubkey, &mint_account.data)?;
+                // Token-2022 transfer fees
+                if *is_2022 {
+                    if let Some(mint_pubkey) = mint {
+                        let mint_account =
+                            CacheUtil::get_account(rpc_client, mint_pubkey, true).await?;
 
-                            if let Some(token2022_mint) =
-                                mint_state.as_any().downcast_ref::<Token2022Mint>()
+                        let token_program =
+                            TokenType::get_token_program_from_owner(&mint_account.owner)?;
+                        let mint_state =
+                            token_program.unpack_mint(mint_pubkey, &mint_account.data)?;
+
+                        if let Some(token2022_mint) =
+                            mint_state.as_any().downcast_ref::<Token2022Mint>()
+                        {
+                            let current_epoch = rpc_client.get_epoch_info().await?.epoch;
+
+                            if let Some(fee_amount) =
+                                token2022_mint.calculate_transfer_fee(*amount, current_epoch)?
                             {
-                                let current_epoch = rpc_client.get_epoch_info().await?.epoch;
-
-                                if let Some(fee_amount) =
-                                    token2022_mint.calculate_transfer_fee(*amount, current_epoch)?
-                                {
-                                    total_transfer_fees = total_transfer_fees
-                                        .checked_add(fee_amount)
-                                        .ok_or_else(|| {
-                                            log::error!(
-                                                "Transfer fee accumulation overflow: total={}, new_fee={}",
-                                                total_transfer_fees,
-                                                fee_amount
-                                            );
-                                            KoraError::ValidationError(
-                                                "Transfer fee accumulation overflow".to_string(),
-                                            )
-                                        })?;
-                                }
+                                total_transfer_fees = total_transfer_fees
+                                    .checked_add(fee_amount)
+                                    .ok_or_else(|| {
+                                    log::error!(
+                                        "Transfer fee accumulation overflow: total={}, new_fee={}",
+                                        total_transfer_fees,
+                                        fee_amount
+                                    );
+                                    KoraError::ValidationError(
+                                        "Transfer fee accumulation overflow".to_string(),
+                                    )
+                                })?;
                             }
                         }
                     }
@@ -210,7 +237,7 @@ impl FeeConfigUtil {
             }
         }
 
-        Ok((has_payment, total_transfer_fees))
+        Ok((has_payment, total_transfer_fees, ata_rent_lamports))
     }
 
     async fn estimate_transaction_fee(
@@ -243,8 +270,18 @@ impl FeeConfigUtil {
         .await?;
 
         // Analyze payment instructions (checks if payment exists + calculates Token2022 fees)
-        let (has_payment, transfer_fee_config_amount) =
+        let (has_payment, transfer_fee_config_amount, ata_rent_lamports) =
             FeeConfigUtil::analyze_payment_instructions(transaction, rpc_client, fee_payer).await?;
+
+        let fee_payer_outflow =
+            fee_payer_outflow.checked_add(ata_rent_lamports).ok_or_else(|| {
+                log::error!(
+                    "Fee payer outflow overflow when adding ATA rent: base_outflow={}, ata_rent={}",
+                    fee_payer_outflow,
+                    ata_rent_lamports
+                );
+                KoraError::ValidationError("Fee payer outflow calculation overflow".to_string())
+            })?;
 
         // If payment is required but not found, add estimated payment instruction fee
         let fee_for_payment_instruction = if is_payment_required && !has_payment {
@@ -520,6 +557,8 @@ mod tests {
         token::{interface::TokenInterface, spl_token::TokenProgram},
         transaction::TransactionUtil,
     };
+    use serde_json::json;
+    use solana_client::rpc_request::RpcRequest;
     use solana_message::{v0, Message, VersionedMessage};
     use solana_sdk::{
         account::Account,
@@ -951,7 +990,7 @@ mod tests {
         let mut resolved_transaction =
             TransactionUtil::new_unsigned_versioned_transaction_resolved(message).unwrap();
 
-        let (has_payment, transfer_fees) = FeeConfigUtil::analyze_payment_instructions(
+        let (has_payment, transfer_fees, _) = FeeConfigUtil::analyze_payment_instructions(
             &mut resolved_transaction,
             &mocked_rpc_client,
             &signer,
@@ -980,7 +1019,7 @@ mod tests {
         let mut resolved_transaction =
             TransactionUtil::new_unsigned_versioned_transaction_resolved(message).unwrap();
 
-        let (has_payment, transfer_fees) = FeeConfigUtil::analyze_payment_instructions(
+        let (has_payment, transfer_fees, _) = FeeConfigUtil::analyze_payment_instructions(
             &mut resolved_transaction,
             &mocked_rpc_client,
             &signer,
@@ -1026,7 +1065,7 @@ mod tests {
         let mut resolved_transaction =
             TransactionUtil::new_unsigned_versioned_transaction_resolved(message).unwrap();
 
-        let (has_payment, transfer_fees) = FeeConfigUtil::analyze_payment_instructions(
+        let (has_payment, transfer_fees, _) = FeeConfigUtil::analyze_payment_instructions(
             &mut resolved_transaction,
             &mocked_rpc_client,
             &signer,
@@ -1180,7 +1219,7 @@ mod tests {
         let mut resolved_transaction =
             TransactionUtil::new_unsigned_versioned_transaction_resolved(message).unwrap();
 
-        let (has_payment, transfer_fees) = FeeConfigUtil::analyze_payment_instructions(
+        let (has_payment, transfer_fees, _) = FeeConfigUtil::analyze_payment_instructions(
             &mut resolved_transaction,
             &mocked_rpc_client,
             &signer,
@@ -1190,6 +1229,78 @@ mod tests {
 
         assert!(has_payment, "Should detect payment instructions");
         assert_eq!(transfer_fees, 0, "Should have no transfer fees for SPL tokens");
+    }
+
+    #[tokio::test]
+    async fn test_estimate_transaction_fee_includes_ata_rent_for_missing_destination() {
+        // Use real config with mock price source
+        let _m = ConfigMockBuilder::new().build_and_setup();
+
+        // Configure CacheUtil to treat destination token account as missing,
+        let cache_ctx = CacheUtil::get_account_context();
+        cache_ctx.checkpoint();
+        cache_ctx
+            .expect()
+            .times(2)
+            .returning(|_, _, _| Err(KoraError::AccountNotFound("missing".to_string())));
+
+        // Mock RPC client:
+        // - base fee = 5000 lamports
+        // - minimum_balance_for_rent_exemption = 2039280 lamports for token account space
+        let rent_value: u64 = 2039280;
+        let mut extra_mocks = std::collections::HashMap::new();
+        extra_mocks.insert(RpcRequest::GetMinimumBalanceForRentExemption, json!(rent_value));
+
+        let mocked_rpc_client =
+            RpcMockBuilder::new().with_fee_estimate(5000).with_custom_mocks(extra_mocks).build();
+
+        // Build a simple SPL token transfer where the destination account does not exist.
+        let fee_payer = Keypair::new();
+        let token_owner = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+
+        let sender_token_account = get_associated_token_address(&token_owner.pubkey(), &mint);
+        let recipient_token_account = get_associated_token_address(&recipient, &mint);
+
+        let transfer_instruction = TokenProgram::new()
+            .create_transfer_checked_instruction(
+                &sender_token_account,
+                &mint,
+                &recipient_token_account,
+                &token_owner.pubkey(),
+                1_000,
+                6,
+            )
+            .unwrap();
+
+        let message = VersionedMessage::Legacy(Message::new(
+            &[transfer_instruction],
+            Some(&fee_payer.pubkey()),
+        ));
+        let mut resolved_transaction =
+            TransactionUtil::new_unsigned_versioned_transaction_resolved(message).unwrap();
+
+        let result = FeeConfigUtil::estimate_transaction_fee(
+            &mocked_rpc_client,
+            &mut resolved_transaction,
+            &fee_payer.pubkey(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        // We expect:
+        // - base_fee = 5000 (from with_fee_estimate)
+        // - no extra Kora signature fee (fee_payer is signer)
+        // - no System outflow and no SPL outflow (fee payer is not the token owner)
+        // - only ATA rent
+        // - no payment instruction fee and no Token-2022 transfer fees
+        let expected_total = 5000 + rent_value;
+        assert_eq!(
+            result.total_fee_lamports, expected_total,
+            "Total fee should include base fee plus ATA rent"
+        );
     }
 
     #[tokio::test]
