@@ -14,6 +14,7 @@ use utoipa::ToSchema;
 pub enum PriceModel {
     Margin { margin: f64 },
     Fixed { amount: u64, token: String, strict: bool },
+    Percentage { percent: f64, min_fee: u64, max_fee: u64 },
     Free,
 }
 

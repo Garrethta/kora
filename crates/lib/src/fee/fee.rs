@@ -21,6 +21,7 @@ use {crate::cache::CacheUtil, crate::state::get_config};
 
 #[cfg(test)]
 use crate::tests::{cache_mock::MockCacheUtil as CacheUtil, config_mock::mock_state::get_config};
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_message::VersionedMessage;
 use solana_sdk::pubkey::Pubkey;
@@ -82,6 +83,15 @@ impl TotalFeeCalculation {
 pub struct FeeConfigUtil {}
 
 impl FeeConfigUtil {
+    fn clamp_fee_lamports(fee: u64, min_fee: u64, max_fee: u64) -> u64 {
+        if fee < min_fee {
+            min_fee
+        } else if fee > max_fee {
+            max_fee
+        } else {
+            fee
+        }
+    }
     fn is_fee_payer_in_signers(
         transaction: &VersionedTransactionResolved,
         fee_payer: &Pubkey,
@@ -286,6 +296,88 @@ impl FeeConfigUtil {
 
         match &config.validation.price.model {
             PriceModel::Free => Ok(TotalFeeCalculation::new_fixed(0)),
+            PriceModel::Percentage { percent, min_fee, max_fee } => {
+                if *percent <= 0.0 {
+                    return Ok(TotalFeeCalculation::new_fixed(0));
+                }
+
+                let mut total_payment_amount: u64 = 0;
+                let parsed_spl_instructions = transaction.get_or_parse_spl_instructions()?;
+
+                let fee_token_mint = if let Some(ParsedSPLInstructionData::SplTokenTransfer {
+                    mint: Some(m),
+                    ..
+                }) = parsed_spl_instructions
+                    .get(&ParsedSPLInstructionType::SplTokenTransfer)
+                    .and_then(|v| v.first())
+                {
+                    *m
+                } else {
+                    return Err(KoraError::ValidationError(
+                        "Cannot determine fee token mint for percentage model".to_string(),
+                    ));
+                };
+
+                if let Some(transfers) =
+                    parsed_spl_instructions.get(&ParsedSPLInstructionType::SplTokenTransfer)
+                {
+                    for transfer in transfers {
+                        if let ParsedSPLInstructionData::SplTokenTransfer { amount, mint, .. } =
+                            transfer
+                        {
+                            if let Some(mint_pubkey) = mint {
+                                if *mint_pubkey == fee_token_mint {
+                                    total_payment_amount = total_payment_amount
+                                        .checked_add(*amount)
+                                        .ok_or_else(|| {
+                                            log::error!(
+                                                "Overflow when accumulating payment amounts: current={}, add={}",
+                                                total_payment_amount,
+                                                amount
+                                            );
+                                            KoraError::ValidationError(
+                                                "Payment amount accumulation overflow"
+                                                    .to_string(),
+                                            )
+                                        })?;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if total_payment_amount == 0 {
+                    return Ok(TotalFeeCalculation::new_fixed(0));
+                }
+
+                let total_payment_value_lamports = TokenUtil::calculate_token_value_in_lamports(
+                    total_payment_amount,
+                    &fee_token_mint,
+                    price_source,
+                    rpc_client,
+                )
+                .await?;
+
+                let percent_decimal =
+                    rust_decimal::Decimal::from_f64(*percent).ok_or_else(|| {
+                        KoraError::ValidationError("Invalid percentage value".to_string())
+                    })?;
+
+                let fee_lamports_unclamped =
+                    rust_decimal::Decimal::from_u64(total_payment_value_lamports)
+                        .and_then(|v| v.checked_mul(percent_decimal))
+                        .and_then(|v| v.ceil().to_u64())
+                        .ok_or_else(|| {
+                            KoraError::ValidationError(
+                                "Percentage fee calculation overflow".to_string(),
+                            )
+                        })?;
+
+                let fee_lamports =
+                    FeeConfigUtil::clamp_fee_lamports(fee_lamports_unclamped, *min_fee, *max_fee);
+
+                Ok(TotalFeeCalculation::new_fixed(fee_lamports))
+            }
             PriceModel::Fixed { strict, .. } => {
                 let fixed_fee_lamports = config
                     .validation
@@ -511,8 +603,8 @@ mod tests {
         fee::fee::{FeeConfigUtil, TransactionFeeUtil},
         tests::{
             common::{
-                create_mock_rpc_client_with_account, create_mock_token_account,
-                setup_or_get_test_config, setup_or_get_test_signer,
+                create_mock_rpc_client_with_account, create_mock_rpc_client_with_mint,
+                create_mock_token_account, setup_or_get_test_config, setup_or_get_test_signer,
             },
             config_mock::ConfigMockBuilder,
             rpc_mock::RpcMockBuilder,
@@ -1233,5 +1325,71 @@ mod tests {
             .unwrap();
 
         assert_eq!(result, 12500, "Should return mocked base fee for V0 message");
+    }
+
+    #[tokio::test]
+    async fn test_percentage_of_transfer_fee_basic_with_clamp() {
+        let mut validation_builder = crate::tests::config_mock::ValidationConfigBuilder::new();
+        {
+            use crate::fee::price::{PriceConfig, PriceModel};
+            validation_builder =
+                validation_builder.with_price_source(crate::oracle::PriceSource::Mock);
+
+            let mut validation_config = validation_builder.build();
+            validation_config.price = PriceConfig {
+                model: PriceModel::Percentage {
+                    percent: 0.1,
+                    min_fee: 10_000_000,
+                    max_fee: 500_000_000,
+                },
+            };
+            let _m = ConfigMockBuilder::new().with_validation(validation_config).build_and_setup();
+        }
+
+        let mocked_rpc_client = create_mock_rpc_client_with_mint(6);
+
+        let fee_payer = Keypair::new();
+        let user = Keypair::new();
+        let recipient = Pubkey::new_unique();
+
+        let usdc_mint = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap();
+
+        let user_token_account = get_associated_token_address(&user.pubkey(), &usdc_mint);
+        let recipient_token_account = get_associated_token_address(&recipient, &usdc_mint);
+
+        let transfer_instruction = TokenProgram::new()
+            .create_transfer_checked_instruction(
+                &user_token_account,
+                &usdc_mint,
+                &recipient_token_account,
+                &user.pubkey(),
+                1_000_000, // 1 USDC
+                6,
+            )
+            .unwrap();
+
+        let message = VersionedMessage::Legacy(Message::new(
+            &[transfer_instruction],
+            Some(&fee_payer.pubkey()),
+        ));
+        let mut resolved_transaction =
+            TransactionUtil::new_unsigned_versioned_transaction_resolved(message).unwrap();
+
+        let result = FeeConfigUtil::estimate_kora_fee(
+            &mocked_rpc_client,
+            &mut resolved_transaction,
+            &fee_payer.pubkey(),
+            false,
+            PriceSource::Mock,
+        )
+        .await
+        .unwrap();
+
+        println!("result: {:?}", result);
+
+        assert_eq!(
+            result.total_fee_lamports, 10_000_000,
+            "Percentage should be clamped up to MIN_FEE_LAMPORTS for small transfers"
+        );
     }
 }
