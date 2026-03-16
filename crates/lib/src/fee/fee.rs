@@ -304,14 +304,37 @@ impl FeeConfigUtil {
                 let mut total_payment_amount: u64 = 0;
                 let parsed_spl_instructions = transaction.get_or_parse_spl_instructions()?;
 
-                let fee_token_mint = if let Some(ParsedSPLInstructionData::SplTokenTransfer {
-                    mint: Some(m),
-                    ..
-                }) = parsed_spl_instructions
-                    .get(&ParsedSPLInstructionType::SplTokenTransfer)
-                    .and_then(|v| v.first())
+                let mut fee_token_mint_opt: Option<Pubkey> = None;
+                if let Some(transfers) =
+                    parsed_spl_instructions.get(&ParsedSPLInstructionType::SplTokenTransfer)
                 {
-                    *m
+                    'outer: for transfer in transfers {
+                        if let ParsedSPLInstructionData::SplTokenTransfer {
+                            mint,
+                            source_address,
+                            ..
+                        } = transfer
+                        {
+                            if let Some(m) = mint {
+                                fee_token_mint_opt = Some(*m);
+                                break 'outer;
+                            } else {
+                                let source_account =
+                                    CacheUtil::get_account(rpc_client, source_address, false)
+                                        .await?;
+                                let token_program =
+                                    TokenType::get_token_program_from_owner(&source_account.owner)?;
+                                let token_account =
+                                    token_program.unpack_token_account(&source_account.data)?;
+                                fee_token_mint_opt = Some(token_account.mint());
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+
+                let fee_token_mint = if let Some(m) = fee_token_mint_opt {
+                    m
                 } else {
                     return Err(KoraError::ValidationError(
                         "Cannot determine fee token mint for percentage model".to_string(),
@@ -322,25 +345,40 @@ impl FeeConfigUtil {
                     parsed_spl_instructions.get(&ParsedSPLInstructionType::SplTokenTransfer)
                 {
                     for transfer in transfers {
-                        if let ParsedSPLInstructionData::SplTokenTransfer { amount, mint, .. } =
-                            transfer
+                        if let ParsedSPLInstructionData::SplTokenTransfer {
+                            amount,
+                            mint,
+                            source_address,
+                            ..
+                        } = transfer
                         {
-                            if let Some(mint_pubkey) = mint {
-                                if *mint_pubkey == fee_token_mint {
-                                    total_payment_amount = total_payment_amount
-                                        .checked_add(*amount)
-                                        .ok_or_else(|| {
-                                            log::error!(
-                                                "Overflow when accumulating payment amounts: current={}, add={}",
-                                                total_payment_amount,
-                                                amount
-                                            );
-                                            KoraError::ValidationError(
-                                                "Payment amount accumulation overflow"
-                                                    .to_string(),
-                                            )
-                                        })?;
-                                }
+                            let mint_pubkey = if let Some(m) = mint {
+                                *m
+                            } else {
+                                let source_account =
+                                    CacheUtil::get_account(rpc_client, source_address, false)
+                                        .await?;
+                                let token_program =
+                                    TokenType::get_token_program_from_owner(&source_account.owner)?;
+                                let token_account =
+                                    token_program.unpack_token_account(&source_account.data)?;
+                                token_account.mint()
+                            };
+
+                            if mint_pubkey == fee_token_mint {
+                                total_payment_amount = total_payment_amount
+                                    .checked_add(*amount)
+                                    .ok_or_else(|| {
+                                        log::error!(
+                                            "Overflow when accumulating payment amounts: current={}, add={}",
+                                            total_payment_amount,
+                                            amount
+                                        );
+                                        KoraError::ValidationError(
+                                            "Payment amount accumulation overflow"
+                                                .to_string(),
+                                        )
+                                    })?;
                             }
                         }
                     }
@@ -1384,8 +1422,6 @@ mod tests {
         )
         .await
         .unwrap();
-
-        println!("result: {:?}", result);
 
         assert_eq!(
             result.total_fee_lamports, 10_000_000,
