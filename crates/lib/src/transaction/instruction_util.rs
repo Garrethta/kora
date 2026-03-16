@@ -1161,6 +1161,11 @@ impl IxUtils {
                     data,
                 })
             }
+            // Newer SPL Token parsed instructions that we can safely ignore for Kora's purposes.
+            // They don't affect fee calculation or fee payer policy validation.
+            "getAccountDataSize" | "initializeImmutableOwner" => {
+                Ok(Self::build_default_compiled_instruction(program_id_index))
+            }
             PARSED_DATA_FIELD_THAW_ACCOUNT => {
                 let account = Self::get_field_as_pubkey(info, PARSED_DATA_FIELD_ACCOUNT)?;
                 let mint = Self::get_field_as_pubkey(info, PARSED_DATA_FIELD_MINT)?;
