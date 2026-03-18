@@ -4,7 +4,7 @@ use crate::{
     constant::{ESTIMATED_LAMPORTS_FOR_PAYMENT_INSTRUCTION, LAMPORTS_PER_SIGNATURE},
     error::KoraError,
     fee::price::PriceModel,
-    oracle::{get_price_oracle, utils::USDC_DEVNET_MINT, PriceSource, RetryingPriceOracle},
+    oracle::{get_price_oracle, PriceSource, RetryingPriceOracle},
     token::{
         spl_token_2022::Token2022Mint,
         token::{TokenType, TokenUtil},
