@@ -1,10 +1,10 @@
-use std::str::FromStr;
+use std::{str::FromStr, time::Duration};
 
 use crate::{
     constant::{ESTIMATED_LAMPORTS_FOR_PAYMENT_INSTRUCTION, LAMPORTS_PER_SIGNATURE},
     error::KoraError,
     fee::price::PriceModel,
-    oracle::PriceSource,
+    oracle::{get_price_oracle, utils::USDC_DEVNET_MINT, PriceSource, RetryingPriceOracle},
     token::{
         spl_token_2022::Token2022Mint,
         token::{TokenType, TokenUtil},
@@ -24,7 +24,7 @@ use crate::tests::{cache_mock::MockCacheUtil as CacheUtil, config_mock::mock_sta
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_message::VersionedMessage;
-use solana_sdk::pubkey::Pubkey;
+use solana_sdk::{native_token::LAMPORTS_PER_SOL, pubkey::Pubkey};
 
 #[derive(Debug, Clone)]
 pub struct TotalFeeCalculation {
@@ -83,7 +83,8 @@ impl TotalFeeCalculation {
 pub struct FeeConfigUtil {}
 
 impl FeeConfigUtil {
-    fn clamp_fee_lamports(fee: u64, min_fee: u64, max_fee: u64) -> u64 {
+    /// Clamp fee value by configured min/max bounds in USDC base units.
+    fn clamp_fee_amount(fee: u64, min_fee: u64, max_fee: u64) -> u64 {
         if fee < min_fee {
             min_fee
         } else if fee > max_fee {
@@ -92,6 +93,10 @@ impl FeeConfigUtil {
             fee
         }
     }
+
+    // const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const USDC_MINT: &str = USDC_DEVNET_MINT;
+
     fn is_fee_payer_in_signers(
         transaction: &VersionedTransactionResolved,
         fee_payer: &Pubkey,
@@ -393,7 +398,7 @@ impl FeeConfigUtil {
                         KoraError::ValidationError("Invalid percentage value".to_string())
                     })?;
 
-                // Compute percent fee directly in token base units (e.g. USDC 6 decimals)
+                // Compute percent fee in token base units.
                 let fee_token_amount_unclamped =
                     rust_decimal::Decimal::from_u64(total_payment_amount)
                         .and_then(|v| v.checked_mul(percent_decimal))
@@ -404,21 +409,88 @@ impl FeeConfigUtil {
                             )
                         })?;
 
-                // Clamp the fee in token by min_fee/max_fee
-                let fee_token_amount_clamped = FeeConfigUtil::clamp_fee_lamports(
-                    fee_token_amount_unclamped,
-                    *min_fee,
-                    *max_fee,
+                let usdc_mint =
+                    Pubkey::from_str(Self::USDC_MINT).map_err(|_| KoraError::ConfigError)?;
+
+                // Convert using USDC price only and assume USDC decimals = 6.
+                let usdc_decimals: u32 = 6;
+                let usdc_scale = rust_decimal::Decimal::from_u64(10u64.pow(usdc_decimals))
+                    .ok_or_else(|| KoraError::ValidationError("Invalid USDC scale".to_string()))?;
+
+                // Fetch USDC price in SOL/USDC.
+                let oracle = RetryingPriceOracle::new(
+                    3,
+                    Duration::from_secs(1),
+                    get_price_oracle(price_source.clone())?,
                 );
 
-                // Convert clamped token fee to lamports once for internal accounting/response.
-                let fee_lamports = TokenUtil::calculate_token_value_in_lamports(
-                    fee_token_amount_clamped,
-                    &fee_token_mint,
-                    price_source,
-                    rpc_client,
-                )
-                .await?;
+                let usdc_token_price = oracle.get_token_price(&usdc_mint.to_string()).await?;
+                let usdc_price = usdc_token_price.price;
+
+                // Translate "token-fee base units" -> "USDC base units"
+                let fee_usdc_amount_unclamped = if fee_token_mint == usdc_mint {
+                    fee_token_amount_unclamped
+                } else {
+                    // Token fee -> lamports (floor)
+                    let fee_token_lamports = TokenUtil::calculate_token_value_in_lamports(
+                        fee_token_amount_unclamped,
+                        &fee_token_mint,
+                        price_source.clone(),
+                        rpc_client,
+                    )
+                    .await?;
+
+                    // Lamports -> USDC base units (ceil)
+                    let denom = rust_decimal::Decimal::from_u64(LAMPORTS_PER_SOL)
+                        .ok_or_else(|| {
+                            KoraError::ValidationError("Invalid LAMPORTS_PER_SOL".to_string())
+                        })?
+                        .checked_mul(usdc_price)
+                        .ok_or_else(|| {
+                            KoraError::ValidationError("USDC conversion overflow".to_string())
+                        })?;
+
+                    rust_decimal::Decimal::from_u64(fee_token_lamports)
+                        .ok_or_else(|| {
+                            KoraError::ValidationError("Invalid token fee lamports".to_string())
+                        })?
+                        .checked_mul(usdc_scale)
+                        .and_then(|v| v.checked_div(denom))
+                        .ok_or_else(|| {
+                            KoraError::ValidationError("USDC conversion overflow".to_string())
+                        })?
+                        .ceil()
+                        .to_u64()
+                        .ok_or_else(|| {
+                            KoraError::ValidationError("USDC amount overflow".to_string())
+                        })?
+                };
+
+                // Clamp the fee in USDC base units by min_fee/max_fee
+                let fee_usdc_amount_clamped =
+                    FeeConfigUtil::clamp_fee_amount(fee_usdc_amount_unclamped, *min_fee, *max_fee);
+
+                // Convert clamped USDC fee to lamports (floor).
+                let lamports_per_sol_decimal = rust_decimal::Decimal::from_u64(LAMPORTS_PER_SOL)
+                    .ok_or_else(|| {
+                        KoraError::ValidationError("Invalid LAMPORTS_PER_SOL".to_string())
+                    })?;
+                let fee_usdc_amount_decimal =
+                    rust_decimal::Decimal::from_u64(fee_usdc_amount_clamped).ok_or_else(|| {
+                        KoraError::ValidationError("Invalid fee_usdc_amount".to_string())
+                    })?;
+
+                let fee_lamports_decimal = fee_usdc_amount_decimal
+                    .checked_mul(usdc_price)
+                    .and_then(|v| v.checked_mul(lamports_per_sol_decimal))
+                    .and_then(|v| v.checked_div(usdc_scale))
+                    .ok_or_else(|| {
+                        KoraError::ValidationError("USDC fee->lamports overflow".to_string())
+                    })?;
+
+                let fee_lamports = fee_lamports_decimal.floor().to_u64().ok_or_else(|| {
+                    KoraError::ValidationError("Lamports value overflow".to_string())
+                })?;
 
                 Ok(TotalFeeCalculation::new_fixed(fee_lamports))
             }
@@ -1374,23 +1446,30 @@ mod tests {
     #[tokio::test]
     async fn test_percentage_of_transfer_fee_basic_with_clamp() {
         let mut validation_builder = crate::tests::config_mock::ValidationConfigBuilder::new();
-        {
-            use crate::fee::price::{PriceConfig, PriceModel};
-            validation_builder =
-                validation_builder.with_price_source(crate::oracle::PriceSource::Mock);
+        use crate::fee::price::{PriceConfig, PriceModel};
+        validation_builder = validation_builder.with_price_source(crate::oracle::PriceSource::Mock);
 
-            let mut validation_config = validation_builder.build();
-            validation_config.price = PriceConfig {
-                model: PriceModel::Percentage {
-                    percent: 0.1,
-                    min_fee: 100_000,   // 0.1 USDC
-                    max_fee: 5_000_000, // 5 USDC
-                },
-            };
-            let _m = ConfigMockBuilder::new().with_validation(validation_config).build_and_setup();
-        }
+        let mut validation_config = validation_builder.build();
+        validation_config.price = PriceConfig {
+            model: PriceModel::Percentage {
+                percent: 0.1,
+                min_fee: 100_000,   // 0.1 USDC
+                max_fee: 5_000_000, // 5 USDC
+            },
+        };
+        let _m = ConfigMockBuilder::new().with_validation(validation_config).build_and_setup();
 
-        let mocked_rpc_client = create_mock_rpc_client_with_mint(6);
+        // We need multiple `getAccountInfo` calls during the token->USDC conversion flow
+        // inside `PriceModel::Percentage`, so mock the same mint account repeatedly.
+        let mint_account = crate::tests::account_mock::create_mock_spl_mint_account(6);
+        let mocked_rpc_client = RpcMockBuilder::new().build_with_sequential_accounts(vec![
+            &mint_account,
+            &mint_account,
+            &mint_account,
+            &mint_account,
+            &mint_account,
+            &mint_account,
+        ]);
 
         let fee_payer = Keypair::new();
         let user = Keypair::new();
@@ -1407,7 +1486,7 @@ mod tests {
                 &usdc_mint,
                 &recipient_token_account,
                 &user.pubkey(),
-                100_000, // 0.1 USDC
+                1_000_000, // 1 USDC, fee = 0.1 USDC = 0.00001 SOL
                 6,
             )
             .unwrap();
@@ -1429,9 +1508,68 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(
-            result.total_fee_lamports, 10_000,
-            "Percentage should be clamped up to MIN_FEE_USDC (converted to lamports) when percent-fee is below min_fee"
-        );
+        assert_eq!(result.total_fee_lamports, 10_000);
+    }
+
+    #[tokio::test]
+    async fn test_percentage_of_transfer_fee_with_non_usdc_token_clamp() {
+        let mut validation_builder = crate::tests::config_mock::ValidationConfigBuilder::new();
+        use crate::fee::price::{PriceConfig, PriceModel};
+
+        validation_builder = validation_builder.with_price_source(crate::oracle::PriceSource::Mock);
+
+        let mut validation_config = validation_builder.build();
+        validation_config.price = PriceConfig {
+            model: PriceModel::Percentage {
+                percent: 0.1,
+                min_fee: 100_000,   // 0.1 USDC
+                max_fee: 5_000_000, // 5 USDC
+            },
+        };
+        let _m = ConfigMockBuilder::new().with_validation(validation_config).build_and_setup();
+
+        const TOKEN_DECIMALS: u8 = 9;
+
+        let mocked_rpc_client = create_mock_rpc_client_with_mint(TOKEN_DECIMALS);
+
+        let fee_payer = Keypair::new();
+        let user = Keypair::new();
+        let recipient = Pubkey::new_unique();
+
+        // Any non-USDC mint uses DEFAULT_MOCKED_PRICE in the mock oracle.
+        let other_mint = Pubkey::new_unique();
+
+        let user_token_account = get_associated_token_address(&user.pubkey(), &other_mint);
+        let recipient_token_account = get_associated_token_address(&recipient, &other_mint);
+
+        let transfer_instruction = TokenProgram::new()
+            .create_transfer_checked_instruction(
+                &user_token_account,
+                &other_mint,
+                &recipient_token_account,
+                &user.pubkey(),
+                100_000_000, // 0.1 token = 1 USDC total payment, fee = 0.1 USDC = 0.00001 SOL
+                TOKEN_DECIMALS,
+            )
+            .unwrap();
+
+        let message = VersionedMessage::Legacy(Message::new(
+            &[transfer_instruction],
+            Some(&fee_payer.pubkey()),
+        ));
+        let mut resolved_transaction =
+            TransactionUtil::new_unsigned_versioned_transaction_resolved(message).unwrap();
+
+        let result = FeeConfigUtil::estimate_kora_fee(
+            &mocked_rpc_client,
+            &mut resolved_transaction,
+            &fee_payer.pubkey(),
+            false,
+            PriceSource::Mock,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.total_fee_lamports, 10_000);
     }
 }
