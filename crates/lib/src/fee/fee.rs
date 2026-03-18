@@ -388,21 +388,14 @@ impl FeeConfigUtil {
                     return Ok(TotalFeeCalculation::new_fixed(0));
                 }
 
-                let total_payment_value_lamports = TokenUtil::calculate_token_value_in_lamports(
-                    total_payment_amount,
-                    &fee_token_mint,
-                    price_source,
-                    rpc_client,
-                )
-                .await?;
-
                 let percent_decimal =
                     rust_decimal::Decimal::from_f64(*percent).ok_or_else(|| {
                         KoraError::ValidationError("Invalid percentage value".to_string())
                     })?;
 
-                let fee_lamports_unclamped =
-                    rust_decimal::Decimal::from_u64(total_payment_value_lamports)
+                // Compute percent fee directly in token base units (e.g. USDC 6 decimals)
+                let fee_token_amount_unclamped =
+                    rust_decimal::Decimal::from_u64(total_payment_amount)
                         .and_then(|v| v.checked_mul(percent_decimal))
                         .and_then(|v| v.ceil().to_u64())
                         .ok_or_else(|| {
@@ -411,8 +404,21 @@ impl FeeConfigUtil {
                             )
                         })?;
 
-                let fee_lamports =
-                    FeeConfigUtil::clamp_fee_lamports(fee_lamports_unclamped, *min_fee, *max_fee);
+                // Clamp the fee in token by min_fee/max_fee
+                let fee_token_amount_clamped = FeeConfigUtil::clamp_fee_lamports(
+                    fee_token_amount_unclamped,
+                    *min_fee,
+                    *max_fee,
+                );
+
+                // Convert clamped token fee to lamports once for internal accounting/response.
+                let fee_lamports = TokenUtil::calculate_token_value_in_lamports(
+                    fee_token_amount_clamped,
+                    &fee_token_mint,
+                    price_source,
+                    rpc_client,
+                )
+                .await?;
 
                 Ok(TotalFeeCalculation::new_fixed(fee_lamports))
             }
@@ -1377,8 +1383,8 @@ mod tests {
             validation_config.price = PriceConfig {
                 model: PriceModel::Percentage {
                     percent: 0.1,
-                    min_fee: 10_000_000,
-                    max_fee: 500_000_000,
+                    min_fee: 100_000,   // 0.1 USDC
+                    max_fee: 5_000_000, // 5 USDC
                 },
             };
             let _m = ConfigMockBuilder::new().with_validation(validation_config).build_and_setup();
@@ -1390,7 +1396,7 @@ mod tests {
         let user = Keypair::new();
         let recipient = Pubkey::new_unique();
 
-        let usdc_mint = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap();
+        let usdc_mint = Pubkey::from_str(crate::oracle::utils::USDC_DEVNET_MINT).unwrap();
 
         let user_token_account = get_associated_token_address(&user.pubkey(), &usdc_mint);
         let recipient_token_account = get_associated_token_address(&recipient, &usdc_mint);
@@ -1401,7 +1407,7 @@ mod tests {
                 &usdc_mint,
                 &recipient_token_account,
                 &user.pubkey(),
-                1_000_000, // 1 USDC
+                100_000, // 0.1 USDC
                 6,
             )
             .unwrap();
@@ -1424,8 +1430,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            result.total_fee_lamports, 10_000_000,
-            "Percentage should be clamped up to MIN_FEE_LAMPORTS for small transfers"
+            result.total_fee_lamports, 10_000,
+            "Percentage should be clamped up to MIN_FEE_USDC (converted to lamports) when percent-fee is below min_fee"
         );
     }
 }
