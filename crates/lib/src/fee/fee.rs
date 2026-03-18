@@ -94,8 +94,8 @@ impl FeeConfigUtil {
         }
     }
 
-    // const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-    const USDC_MINT: &str = USDC_DEVNET_MINT;
+    const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    // const USDC_MINT: &str = USDC_DEVNET_MINT;
 
     fn is_fee_payer_in_signers(
         transaction: &VersionedTransactionResolved,
