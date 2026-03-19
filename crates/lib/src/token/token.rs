@@ -58,6 +58,8 @@ impl TokenType {
 pub struct TokenUtil;
 
 impl TokenUtil {
+    const TOLERANCE_PERCENT: u128 = 2;
+
     pub fn check_valid_tokens(tokens: &[String]) -> Result<Vec<Pubkey>, KoraError> {
         tokens
             .iter()
@@ -650,7 +652,10 @@ impl TokenUtil {
             }
         }
 
-        Ok(total_lamport_value >= required_lamports)
+        let tolerated_total =
+            u128::from(total_lamport_value).saturating_mul(100 + Self::TOLERANCE_PERCENT) / 100;
+
+        Ok(tolerated_total >= u128::from(required_lamports))
     }
 }
 

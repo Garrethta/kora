@@ -25,6 +25,7 @@ use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_message::VersionedMessage;
 use solana_sdk::{native_token::LAMPORTS_PER_SOL, pubkey::Pubkey};
+use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
 
 #[derive(Debug, Clone)]
 pub struct TotalFeeCalculation {
@@ -306,8 +307,11 @@ impl FeeConfigUtil {
                     return Ok(TotalFeeCalculation::new_fixed(0));
                 }
 
-                let mut total_payment_amount: u64 = 0;
+                let mut total_billable_amount: u64 = 0;
+
                 let parsed_spl_instructions = transaction.get_or_parse_spl_instructions()?;
+
+                let payment_destination = config.kora.get_payment_address(fee_payer)?;
 
                 let mut fee_token_mint_opt: Option<Pubkey> = None;
                 if let Some(transfers) =
@@ -354,6 +358,8 @@ impl FeeConfigUtil {
                             amount,
                             mint,
                             source_address,
+                            destination_address,
+                            is_2022,
                             ..
                         } = transfer
                         {
@@ -371,12 +377,29 @@ impl FeeConfigUtil {
                             };
 
                             if mint_pubkey == fee_token_mint {
-                                total_payment_amount = total_payment_amount
+                                // Exclude payment transfers from the percentage base by comparing
+                                // the destination address with the expected payment ATA.
+                                let token_program_id = if *is_2022 {
+                                    spl_token_2022_interface::id()
+                                } else {
+                                    spl_token_interface::id()
+                                };
+                                let expected_payment_ata =
+                                    get_associated_token_address_with_program_id(
+                                        &payment_destination,
+                                        &mint_pubkey,
+                                        &token_program_id,
+                                    );
+                                if *destination_address == expected_payment_ata {
+                                    continue;
+                                }
+
+                                total_billable_amount = total_billable_amount
                                     .checked_add(*amount)
                                     .ok_or_else(|| {
                                         log::error!(
                                             "Overflow when accumulating payment amounts: current={}, add={}",
-                                            total_payment_amount,
+                                            total_billable_amount,
                                             amount
                                         );
                                         KoraError::ValidationError(
@@ -389,7 +412,7 @@ impl FeeConfigUtil {
                     }
                 }
 
-                if total_payment_amount == 0 {
+                if total_billable_amount == 0 {
                     return Ok(TotalFeeCalculation::new_fixed(0));
                 }
 
@@ -400,7 +423,7 @@ impl FeeConfigUtil {
 
                 // Compute percent fee in token base units.
                 let fee_token_amount_unclamped =
-                    rust_decimal::Decimal::from_u64(total_payment_amount)
+                    rust_decimal::Decimal::from_u64(total_billable_amount)
                         .and_then(|v| v.checked_mul(percent_decimal))
                         .and_then(|v| v.ceil().to_u64())
                         .ok_or_else(|| {
